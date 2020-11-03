@@ -4,25 +4,46 @@
 package e2e_test
 
 import (
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"context"
 	"testing"
 	"time"
-
 	"github.com/cortexproject/cortex/integration/e2e"
 	"github.com/prometheus/common/model"
-
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/receive"
 	"github.com/thanos-io/thanos/pkg/testutil"
 	"github.com/thanos-io/thanos/test/e2e/e2ethanos"
+	"log"
 )
 
+type ReverseProxyConfig struct {
+	tenant_id string
+	port      string
+	target    string
+}
+
+func generateProxy(conf ReverseProxyConfig) {
+	originurl, _ := url.Parse(conf.target)
+	director := func(req *http.Request) {
+		req.Header.Add("tenant_id", conf.tenant_id)
+		req.Header.Add("X-Origin-Host", originurl.Host)
+		req.URL.Scheme = "http"
+		req.URL.Host = originurl.Host
+	}
+	proxy := &httputil.ReverseProxy{Director: director}
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
+	})
+	log.Fatal(http.ListenAndServe(conf.port, nil))
+}
 func TestReceive(t *testing.T) {
 	t.Parallel()
 
 	t.Run("hashring", func(t *testing.T) {
 		t.Parallel()
-
 		s, err := e2e.NewScenario("e2e_test_receive_hashring")
 		testutil.Ok(t, err)
 		t.Cleanup(e2ethanos.CleanScenario(t, s))
@@ -204,12 +225,14 @@ func TestReceive(t *testing.T) {
 		// Recreate again, but with hashring config.
 		r1, err = e2ethanos.NewReceiver(s.SharedDir(), s.NetworkName(), "1", 3, h)
 		testutil.Ok(t, err)
+
 		r2, err = e2ethanos.NewReceiver(s.SharedDir(), s.NetworkName(), "2", 3, h)
 		testutil.Ok(t, err)
 		testutil.Ok(t, s.StartAndWaitReady(r1, r2))
 
 		prom1, _, err := e2ethanos.NewPrometheus(s.SharedDir(), "1", defaultPromConfig("prom1", 0, e2ethanos.RemoteWriteEndpoint(r1.NetworkEndpoint(8081)), ""), e2ethanos.DefaultPrometheusImage())
 		testutil.Ok(t, err)
+		log.Print(e2ethanos.RemoteWriteEndpoint(r1.NetworkEndpoint(8081)))
 		testutil.Ok(t, s.StartAndWaitReady(prom1))
 
 		q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{r1.GRPCNetworkEndpoint(), r2.GRPCNetworkEndpoint()}, nil, nil, "", "")
@@ -240,4 +263,56 @@ func TestReceive(t *testing.T) {
 			},
 		})
 	})
+
+	t.Run("multitenancy", func(t *testing.T) {
+		t.Parallel()
+
+		s, err := e2e.NewScenario("e2e_test_for_multitenancy")
+		testutil.Ok(t, err)
+		t.Cleanup(e2ethanos.CleanScenario(t, s))
+
+		// The replication suite creates a three-node hashring but one of the
+		// receivers is dead. In this case, replication should still
+		// succeed and the time series should be replicated to the other nodes.
+		r1, err := e2ethanos.NewReceiver(s.SharedDir(), s.NetworkName(), "1", 3)
+		testutil.Ok(t, err)
+		h := receive.HashringConfig{
+			Endpoints: []string{
+				r1.GRPCNetworkEndpointFor(s.NetworkName()),
+			},
+		}
+
+		// Recreate again, but with hashring config.
+		r1, err = e2ethanos.NewReceiver(s.SharedDir(), s.NetworkName(), "1", 3, h)
+		testutil.Ok(t, err)
+		testutil.Ok(t, s.StartAndWaitReady(r1))
+		testutil.Ok(t, err)
+		conf1 := ReverseProxyConfig{
+			tenant_id: "tenant-1",
+			port:      ":9097",
+			target:    e2ethanos.RemoteWriteEndpoint(r1.NetworkEndpoint(8080)),
+		}
+		q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{r1.GRPCNetworkEndpoint()}, nil, nil, "", "")
+		testutil.Ok(t, err)
+		testutil.Ok(t, s.StartAndWaitReady(q))
+		go generateProxy(conf1)
+		prom1, _, err := e2ethanos.NewPrometheus(s.SharedDir(), "1", defaultPromConfig("prom1", 0, "http://localhost:9097", ""), e2ethanos.DefaultPrometheusImage())
+		testutil.Ok(t, err)
+		testutil.Ok(t, s.StartAndWaitReady(prom1))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		t.Cleanup(cancel)
+		testutil.Ok(t, q.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"thanos_store_nodes_grpc_connections"}, e2e.WaitMissingMetrics))
+		queryAndAssertSeries(t, ctx, q.HTTPEndpoint(), queryUpWithoutInstance, promclient.QueryOptions{
+			Deduplicate: false,
+		}, []model.Metric{
+			{
+				"job":        "myself",
+				"prometheus": "prom1",
+				"receive":    "1",
+				"replica":    "0",
+				"tenant_id":  "tenant-1",
+			},
+		})
+	})
 }
+
